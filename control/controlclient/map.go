@@ -7,7 +7,6 @@ import (
 	"cmp"
 	"context"
 	"encoding/json"
-	"fmt"
 	"maps"
 	"net"
 	"reflect"
@@ -166,6 +165,7 @@ func (ms *mapSession) HandleNonKeepAliveMapResponse(ctx context.Context, resp *t
 
 	// For responses that mutate the self node, check for updated nodeAttrs.
 	if resp.Node != nil {
+		upgradeNode(resp.Node)
 		if DevKnob.StripCaps() {
 			resp.Node.Capabilities = nil
 			resp.Node.CapMap = nil
@@ -179,6 +179,13 @@ func (ms *mapSession) HandleNonKeepAliveMapResponse(ctx context.Context, resp *t
 			}
 		}
 		ms.controlKnobs.UpdateFromNodeAttributes(resp.Node.CapMap)
+	}
+
+	for _, p := range resp.Peers {
+		upgradeNode(p)
+	}
+	for _, p := range resp.PeersChanged {
+		upgradeNode(p)
 	}
 
 	// Call Node.InitDisplayNames on any changed nodes.
@@ -214,6 +221,30 @@ func (ms *mapSession) HandleNonKeepAliveMapResponse(ctx context.Context, resp *t
 
 	ms.netmapUpdater.UpdateFullNetmap(nm)
 	return nil
+}
+
+// upgradeNode upgrades Node fields from the server into the modern forms
+// not using deprecated fields.
+func upgradeNode(n *tailcfg.Node) {
+	if n == nil {
+		return
+	}
+	if n.LegacyDERPString != "" {
+		if n.HomeDERP == 0 {
+			ip, portStr, err := net.SplitHostPort(n.LegacyDERPString)
+			if ip == tailcfg.DerpMagicIP && err == nil {
+				port, err := strconv.Atoi(portStr)
+				if err == nil {
+					n.HomeDERP = port
+				}
+			}
+		}
+		n.LegacyDERPString = ""
+	}
+
+	if n.AllowedIPs == nil {
+		n.AllowedIPs = slices.Clone(n.Addresses)
+	}
 }
 
 func (ms *mapSession) tryHandleIncrementally(res *tailcfg.MapResponse) bool {
@@ -443,7 +474,7 @@ func (ms *mapSession) updatePeersStateFromResponse(resp *tailcfg.MapResponse) (s
 		stats.changed++
 		mut := vp.AsStruct()
 		if pc.DERPRegion != 0 {
-			mut.DERP = fmt.Sprintf("%s:%v", tailcfg.DerpMagicIP, pc.DERPRegion)
+			mut.HomeDERP = pc.DERPRegion
 			patchDERPRegion.Add(1)
 		}
 		if pc.Cap != 0 {
@@ -631,17 +662,13 @@ func peerChangeDiff(was tailcfg.NodeView, n *tailcfg.Node) (_ *tailcfg.PeerChang
 			if !views.SliceEqual(was.Endpoints(), views.SliceOf(n.Endpoints)) {
 				pc().Endpoints = slices.Clone(n.Endpoints)
 			}
-		case "DERP":
-			if was.DERP() != n.DERP {
-				ip, portStr, err := net.SplitHostPort(n.DERP)
-				if err != nil || ip != "127.3.3.40" {
-					return nil, false
-				}
-				port, err := strconv.Atoi(portStr)
-				if err != nil || port < 1 || port > 65535 {
-					return nil, false
-				}
-				pc().DERPRegion = port
+		case "LegacyDERPString":
+			if was.LegacyDERPString() != "" || n.LegacyDERPString != "" {
+				panic("unexpected; caller should've already called upgradeNode")
+			}
+		case "HomeDERP":
+			if was.HomeDERP() != n.HomeDERP {
+				pc().DERPRegion = n.HomeDERP
 			}
 		case "Hostinfo":
 			if !was.Hostinfo().Valid() && !n.Hostinfo.Valid() {
@@ -689,13 +716,11 @@ func peerChangeDiff(was tailcfg.NodeView, n *tailcfg.Node) (_ *tailcfg.PeerChang
 				return nil, false
 			}
 		case "Online":
-			wasOnline := was.Online()
-			if n.Online != nil && wasOnline != nil && *n.Online != *wasOnline {
+			if wasOnline, ok := was.Online().GetOk(); ok && n.Online != nil && *n.Online != wasOnline {
 				pc().Online = ptr.To(*n.Online)
 			}
 		case "LastSeen":
-			wasSeen := was.LastSeen()
-			if n.LastSeen != nil && wasSeen != nil && !wasSeen.Equal(*n.LastSeen) {
+			if wasSeen, ok := was.LastSeen().GetOk(); ok && n.LastSeen != nil && !wasSeen.Equal(*n.LastSeen) {
 				pc().LastSeen = ptr.To(*n.LastSeen)
 			}
 		case "MachineAuthorized":
@@ -720,18 +745,18 @@ func peerChangeDiff(was tailcfg.NodeView, n *tailcfg.Node) (_ *tailcfg.PeerChang
 			}
 		case "SelfNodeV4MasqAddrForThisPeer":
 			va, vb := was.SelfNodeV4MasqAddrForThisPeer(), n.SelfNodeV4MasqAddrForThisPeer
-			if va == nil && vb == nil {
+			if !va.Valid() && vb == nil {
 				continue
 			}
-			if va == nil || vb == nil || *va != *vb {
+			if va, ok := va.GetOk(); !ok || vb == nil || va != *vb {
 				return nil, false
 			}
 		case "SelfNodeV6MasqAddrForThisPeer":
 			va, vb := was.SelfNodeV6MasqAddrForThisPeer(), n.SelfNodeV6MasqAddrForThisPeer
-			if va == nil && vb == nil {
+			if !va.Valid() && vb == nil {
 				continue
 			}
-			if va == nil || vb == nil || *va != *vb {
+			if va, ok := va.GetOk(); !ok || vb == nil || va != *vb {
 				return nil, false
 			}
 		case "ExitNodeDNSResolvers":

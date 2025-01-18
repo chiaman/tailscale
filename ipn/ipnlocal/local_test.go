@@ -1007,8 +1007,8 @@ func TestUpdateNetmapDelta(t *testing.T) {
 
 	wants := []*tailcfg.Node{
 		{
-			ID:   1,
-			DERP: "127.3.3.40:1",
+			ID:       1,
+			HomeDERP: 1,
 		},
 		{
 			ID:     2,
@@ -1498,6 +1498,53 @@ func TestReconfigureAppConnector(t *testing.T) {
 	}
 	if v, _ := b.hostinfo.AppConnector.Get(); v {
 		t.Fatalf("expected no app connector service")
+	}
+}
+
+func TestBackfillAppConnectorRoutes(t *testing.T) {
+	// Create backend with an empty app connector.
+	b := newTestBackend(t)
+	if err := b.Start(ipn.Options{}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := b.EditPrefs(&ipn.MaskedPrefs{
+		Prefs: ipn.Prefs{
+			AppConnector: ipn.AppConnectorPrefs{Advertise: true},
+		},
+		AppConnectorSet: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	b.reconfigAppConnectorLocked(b.netMap, b.pm.prefs)
+
+	// Smoke check that AdvertiseRoutes doesn't have the test IP.
+	ip := netip.MustParseAddr("1.2.3.4")
+	routes := b.Prefs().AdvertiseRoutes().AsSlice()
+	if slices.Contains(routes, netip.PrefixFrom(ip, ip.BitLen())) {
+		t.Fatalf("AdvertiseRoutes %v on a fresh backend already contains advertised route for %v", routes, ip)
+	}
+
+	// Store the test IP in profile data, but not in Prefs.AdvertiseRoutes.
+	b.ControlKnobs().AppCStoreRoutes.Store(true)
+	if err := b.storeRouteInfo(&appc.RouteInfo{
+		Domains: map[string][]netip.Addr{
+			"example.com": {ip},
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	// Mimic b.authReconfigure for the app connector bits.
+	b.mu.Lock()
+	b.reconfigAppConnectorLocked(b.netMap, b.pm.prefs)
+	b.mu.Unlock()
+	b.readvertiseAppConnectorRoutes()
+
+	// Check that Prefs.AdvertiseRoutes got backfilled with routes stored in
+	// profile data.
+	routes = b.Prefs().AdvertiseRoutes().AsSlice()
+	if !slices.Contains(routes, netip.PrefixFrom(ip, ip.BitLen())) {
+		t.Fatalf("AdvertiseRoutes %v was not backfilled from stored app connector routes with %v", routes, ip)
 	}
 }
 
@@ -2021,7 +2068,7 @@ func TestAutoExitNodeSetNetInfoCallback(t *testing.T) {
 			netip.MustParsePrefix("100.64.1.1/32"),
 			netip.MustParsePrefix("fe70::1/128"),
 		},
-		DERP: "127.3.3.40:2",
+		HomeDERP: 2,
 	}
 	defaultDERPMap := &tailcfg.DERPMap{
 		Regions: map[int]*tailcfg.DERPRegion{
@@ -2985,7 +3032,7 @@ func makePeer(id tailcfg.NodeID, opts ...peerOptFunc) tailcfg.NodeView {
 		ID:       id,
 		StableID: tailcfg.StableNodeID(fmt.Sprintf("stable%d", id)),
 		Name:     fmt.Sprintf("peer%d", id),
-		DERP:     fmt.Sprintf("127.3.3.40:%d", id),
+		HomeDERP: int(id),
 	}
 	for _, opt := range opts {
 		opt(node)
@@ -3001,13 +3048,13 @@ func withName(name string) peerOptFunc {
 
 func withDERP(region int) peerOptFunc {
 	return func(n *tailcfg.Node) {
-		n.DERP = fmt.Sprintf("127.3.3.40:%d", region)
+		n.HomeDERP = region
 	}
 }
 
 func withoutDERP() peerOptFunc {
 	return func(n *tailcfg.Node) {
-		n.DERP = ""
+		n.HomeDERP = 0
 	}
 }
 
